@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>方塊跑酷 (三段跳+衝刺)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans TC', sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            background-color: #1a1a1a;
+            display: block;
+            border-radius: 0.5rem;
+            box-shadow: 0 0 25px rgba(255, 165, 0, 0.5); /* 橘色光暈 */
+        }
+        .text-orange-glow {
+            text-shadow: 0 0 12px rgba(255, 165, 0, 0.8);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+    <div id="gameContainer" class="w-full h-screen flex flex-col justify-center items-center p-4">
+        <h1 class="text-4xl font-bold mb-4 text-orange-400 text-orange-glow">方塊跑酷：三段跳+衝刺</h1>
+        <div class="w-full max-w-4xl grid grid-cols-4 gap-2 items-center mb-2 px-2 text-center">
+            <div class="text-lg sm:text-2xl font-semibold">分數: <span id="score">0</span></div>
+            <div class="text-lg sm:text-xl font-semibold">剩餘跳躍: <span id="jumpsLeft">3</span></div>
+            <div class="text-lg sm:text-xl font-semibold">衝刺: <span id="dashStatus">就緒</span></div>
+            <div class="text-lg sm:text-2xl font-semibold">最高分: <span id="highScore">0</span></div>
+        </div>
+        <canvas id="gameCanvas"></canvas>
+        <div id="messageOverlay" class="absolute inset-0 bg-black bg-opacity-60 flex justify-center items-center text-center">
+            <div id="messageBox" class="text-4xl font-bold text-orange-glow">
+                <p>點擊/空白鍵跳躍，Shift鍵衝刺</p>
+                <p class="text-xl mt-4">您可以在空中跳三次並進行衝刺！</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 遊戲設定與變數 ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreEl = document.getElementById('score');
+        const highScoreEl = document.getElementById('highScore');
+        const jumpsLeftEl = document.getElementById('jumpsLeft');
+        const dashStatusEl = document.getElementById('dashStatus');
+        const messageOverlay = document.getElementById('messageOverlay');
+        const messageBox = document.getElementById('messageBox');
+
+        let score = 0;
+        let highScore = localStorage.getItem('cubeParkourHighScore') || 0;
+        let gameSpeed = 6;
+        let gameSpeedIncrease = 0.002;
+        let gravity = 0.6;
+        let isGameActive = false;
+        let animationFrameId;
+
+        let obstacles = [];
+        let obstacleSpawnTimer = 0;
+        let nextObstacleInterval = 100;
+
+        let particles = [];
+        let trailParticles = [];
+
+        // --- 調整畫布大小 ---
+        function resizeCanvas() {
+            const container = document.getElementById('gameContainer');
+            const maxWidth = 1024;
+            const containerWidth = container.clientWidth - 32;
+            const containerHeight = container.clientHeight * 0.7;
+
+            const canvasWidth = Math.min(containerWidth, maxWidth);
+            const aspectRatio = 16 / 9;
+            canvas.width = canvasWidth;
+            canvas.height = canvasWidth / aspectRatio;
+
+            if (canvas.height > containerHeight) {
+                canvas.height = containerHeight;
+                canvas.width = containerHeight * aspectRatio;
+            }
+        }
+
+        // --- 粒子物件 ---
+        class Particle {
+            constructor(x, y, size, color, velocity) {
+                this.x = x;
+                this.y = y;
+                this.size = size;
+                this.color = color;
+                this.velocity = velocity;
+                this.alpha = 1;
+            }
+
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = this.alpha;
+                ctx.fillStyle = this.color;
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+                ctx.restore();
+            }
+
+            update() {
+                this.x += this.velocity.x;
+                this.y += this.velocity.y;
+                this.alpha -= 0.04;
+            }
+        }
+
+        // --- 玩家物件 ---
+        class Player {
+            constructor(x, y, size) {
+                this.x = x;
+                this.y = y;
+                this.size = size;
+                this.velocityY = 0;
+                
+                // 跳躍能力
+                this.maxJumps = 3;
+                this.jumpsLeft = this.maxJumps;
+
+                // 衝刺能力
+                this.isDashing = false;
+                this.dashDuration = 0;
+                this.maxDashDuration = 45; // 衝刺持續時間 (幀)
+                this.dashCooldown = 0;
+                this.maxDashCooldown = 240; // 衝刺冷卻時間 (4秒 @ 60fps)
+            }
+
+            draw() {
+                const trailAlpha = this.isDashing ? 0.3 : 0.1;
+                trailParticles.push(new Particle(this.x, this.y, this.size, `rgba(255, 165, 0, ${trailAlpha})`, {x: 0, y: 0}));
+
+                ctx.shadowBlur = this.isDashing ? 30 : 15;
+                ctx.shadowColor = this.isDashing ? 'white' : 'orange';
+                ctx.fillStyle = this.isDashing ? 'white' : 'orange';
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+                ctx.shadowBlur = 0;
+            }
+
+            update() {
+                // 更新跳躍邏輯
+                this.y += this.velocityY;
+                const groundY = canvas.height - this.size - 20;
+
+                if (this.y < groundY) {
+                    this.velocityY += gravity;
+                } else {
+                    this.velocityY = 0;
+                    this.y = groundY;
+                    if (this.jumpsLeft !== this.maxJumps) {
+                        this.jumpsLeft = this.maxJumps;
+                        for (let i = 0; i < 10; i++) {
+                            particles.push(new Particle(this.x + this.size / 2, this.y + this.size, Math.random() * 3, 'orange', { x: (Math.random() - 0.5) * 4, y: -Math.random() * 2 }));
+                        }
+                    }
+                }
+                jumpsLeftEl.textContent = this.jumpsLeft;
+
+                // 更新衝刺邏輯
+                if (this.isDashing) {
+                    this.dashDuration--;
+                    if (this.dashDuration <= 0) {
+                        this.isDashing = false;
+                    }
+                }
+                if (this.dashCooldown > 0) {
+                    this.dashCooldown--;
+                }
+                
+                // 更新UI
+                if (this.dashCooldown > 0) {
+                    dashStatusEl.textContent = `冷卻 ${Math.ceil(this.dashCooldown / 60)}s`;
+                } else {
+                    dashStatusEl.textContent = '就緒';
+                }
+            }
+
+            jump() {
+                if (this.jumpsLeft > 0) {
+                    this.velocityY = -14;
+                    this.jumpsLeft--;
+                    for (let i = 0; i < 5; i++) {
+                        particles.push(new Particle(this.x + this.size / 2, this.y + this.size, Math.random() * 4, 'white', { x: (Math.random() - 0.5) * 2, y: Math.random() * 2 + 1 }));
+                    }
+                }
+            }
+
+            dash() {
+                if (this.dashCooldown <= 0) {
+                    this.isDashing = true;
+                    this.dashDuration = this.maxDashDuration;
+                    this.dashCooldown = this.maxDashCooldown;
+                     for (let i = 0; i < 20; i++) {
+                        particles.push(new Particle(this.x + this.size / 2, this.y + this.size / 2, Math.random() * 5, 'white', { x: -Math.random() * 5 - 5, y: (Math.random() - 0.5) * 5 }));
+                    }
+                }
+            }
+        }
+
+        // --- 障礙物物件 ---
+        class Obstacle {
+            constructor(x, y, width, height, speed) {
+                this.x = x;
+                this.y = y;
+                this.width = width;
+                this.height = height;
+                this.speed = speed;
+            }
+
+            draw() {
+                ctx.fillStyle = '#f6ad55';
+                ctx.fillRect(this.x, this.y, this.width, this.height);
+            }
+
+            update() {
+                this.x -= this.speed;
+            }
+        }
+
+        let player;
+
+        // --- 初始化遊戲 ---
+        function init() {
+            resizeCanvas();
+            highScoreEl.textContent = highScore;
+            
+            const playerSize = canvas.width * 0.04;
+            player = new Player(80, canvas.height - playerSize - 20, playerSize);
+            
+            obstacles = [];
+            particles = [];
+            trailParticles = [];
+            score = 0;
+            gameSpeed = 6;
+            scoreEl.textContent = score;
+            jumpsLeftEl.textContent = player.maxJumps;
+            dashStatusEl.textContent = '就緒';
+            
+            drawInitialState();
+        }
+
+        function drawInitialState() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawBackground();
+            drawGround();
+            player.draw();
+        }
+        
+        // --- 繪製背景與地面 ---
+        function drawBackground() {
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < canvas.width; i += 30) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i, canvas.height);
+                ctx.stroke();
+            }
+            for (let i = 0; i < canvas.height; i += 30) {
+                ctx.beginPath();
+                ctx.moveTo(0, i);
+                ctx.lineTo(canvas.width, i);
+                ctx.stroke();
+            }
+        }
+        
+        function drawGround() {
+            ctx.fillStyle = '#444';
+            ctx.fillRect(0, canvas.height - 20, canvas.width, 20);
+        }
+
+        // --- 產生障礙物 ---
+        function spawnObstacle() {
+            obstacleSpawnTimer++;
+            if (obstacleSpawnTimer > nextObstacleInterval) {
+                obstacleSpawnTimer = 0;
+                const currentSpeed = player.isDashing ? gameSpeed * 3 : gameSpeed;
+                nextObstacleInterval = Math.random() * (120 - 70) + 70 / (currentSpeed / 6);
+
+                const groundY = canvas.height - 20;
+                const size = Math.random() * 30 + 20;
+                const type = Math.random();
+
+                if (type < 0.6) {
+                    obstacles.push(new Obstacle(canvas.width, groundY - size, size, size, 0));
+                } else {
+                    const count = Math.random() > 0.5 ? 2 : 3;
+                    for (let i = 0; i < count; i++) {
+                        obstacles.push(new Obstacle(canvas.width, groundY - size * (i + 1), size, size, 0));
+                    }
+                }
+            }
+        }
+        
+        // --- 碰撞檢測 ---
+        function checkCollision() {
+            if (player.isDashing) return; // 衝刺時無敵
+
+            for (const obs of obstacles) {
+                if (
+                    player.x < obs.x + obs.width &&
+                    player.x + player.size > obs.x &&
+                    player.y < obs.y + obs.height &&
+                    player.y + player.size > obs.y
+                ) {
+                    gameOver();
+                }
+            }
+        }
+
+        // --- 遊戲結束 ---
+        function gameOver() {
+            isGameActive = false;
+            cancelAnimationFrame(animationFrameId);
+            
+            if (score > highScore) {
+                highScore = score;
+                localStorage.setItem('cubeParkourHighScore', highScore);
+                highScoreEl.textContent = highScore;
+            }
+            
+            messageBox.innerHTML = `<p>遊戲結束！</p><p class="text-2xl mt-2">你的分數: ${score}</p><p class="text-xl mt-4">再次點擊以重新開始</p>`;
+            messageOverlay.style.display = 'flex';
+        }
+
+        // --- 遊戲主循環 ---
+        function animate() {
+            if (!isGameActive) return;
+
+            animationFrameId = requestAnimationFrame(animate);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            drawBackground();
+            drawGround();
+
+            trailParticles.forEach((p, index) => {
+                p.alpha -= 0.08;
+                p.draw();
+                if (p.alpha <= 0) {
+                    trailParticles.splice(index, 1);
+                }
+            });
+
+            particles.forEach((p, index) => {
+                p.update();
+                p.draw();
+                if (p.alpha <= 0) {
+                    particles.splice(index, 1);
+                }
+            });
+
+            player.update();
+            player.draw();
+
+            const currentSpeed = player.isDashing ? gameSpeed * 3 : gameSpeed;
+
+            spawnObstacle();
+            obstacles.forEach((obs, index) => {
+                obs.speed = currentSpeed;
+                obs.update();
+                obs.draw();
+                if (obs.x + obs.width < 0) {
+                    obstacles.splice(index, 1);
+                }
+            });
+
+            checkCollision();
+            
+            score++;
+            scoreEl.textContent = score;
+            if (!player.isDashing) { // 衝刺時不增加基礎速度
+                 gameSpeed += gameSpeedIncrease;
+            }
+        }
+        
+        // --- 開始遊戲 ---
+        function startGame() {
+            if (isGameActive) return;
+            init();
+            isGameActive = true;
+            messageOverlay.style.display = 'none';
+            animate();
+        }
+
+        // --- 事件監聽 ---
+        window.addEventListener('resize', init);
+
+        document.body.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                if (!isGameActive) startGame();
+                else player.jump();
+            }
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+                 if (isGameActive) player.dash();
+            }
+        });
+        
+        // 暫不支援觸控衝刺
+        window.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            if (!isGameActive) startGame();
+            else player.jump();
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            if (!isGameActive) startGame();
+            else player.jump();
+        });
+
+        // --- 初始載入 ---
+        init();
+    </script>
+
+</body>
+</html>
+
